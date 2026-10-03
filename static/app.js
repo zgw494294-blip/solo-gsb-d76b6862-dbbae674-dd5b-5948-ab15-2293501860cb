@@ -1190,10 +1190,14 @@ const elecError = document.getElementById("elec-error");
 const elecResult = document.getElementById("elec-result");
 const elecSubmitBtn = document.getElementById("elec-submit-btn");
 
-// trialSeq：试算代际。切换炉次、刷新详情、重建功率表、编辑任一输入都会 +1；
-// 只有最新一代的成功响应 / 失败响应 / 网络异常允许回填，迟到回包一律丢弃。
+// trialSeq：试算代际。切换炉次、刷新详情、编辑任一输入、正式发起试算都会 +1；
+// 只有“当前最新一代”自身的成功响应 / HTTP 错误 / 网络异常允许回填。旧代际的
+// 回包（哪怕是切走后又回到原炉次才到达）一律丢弃：不回填结果、不写提示、
+// 不动按钮，也不受旧请求是否已经结束影响。
 let trialSeq = 0;
-let trialInflight = 0; // 在途试算请求数（用于正确恢复按钮，避免旧回包解锁新请求）
+// 当前代际是否正有一笔试算在途：为 true 时按钮禁用并阻止重复提交；
+// 编辑输入 / 切换炉次 / 刷新生效新一代后即为 false，旧在途请求不再影响它。
+let trialLoading = false;
 let elecDraft = null; // 当前试算所绑定的已归档炉次
 
 // 24 小时电价输入（00～23 时）只需建一次；数值作为试算输入保留
@@ -1213,11 +1217,21 @@ function clearTrialOutput() {
   elecResult.innerHTML = "";
 }
 
+function resetTrialButton() {
+  // 按钮只表达“当前这一代”的状态：只要当前没有在途试算，立即可再次提交，
+  // 无需等待任何旧请求结束（旧请求的回包按代际作废，不会再动按钮）。
+  elecSubmitBtn.disabled = false;
+  elecSubmitBtn.textContent = "试算电费";
+}
+
 function invalidateTrial() {
-  // 旧试算立即作废：代际 +1、清空结果与错误（输入框本身保留供继续编辑）
+  // 旧试算立即作废：代际 +1、清空结果与错误提示，并恢复提交能力
+  // （输入框本身保留供继续编辑；卡片隐藏时按钮同样复位，不影响其他界面）
   trialSeq += 1;
+  trialLoading = false;
   clearTrialOutput();
   elecError.hidden = true;
+  resetTrialButton();
 }
 
 function rebuildPowerInputs(temperatures) {
@@ -1248,11 +1262,11 @@ function hideTrial() {
   elecCard.hidden = true;
 }
 
-// 编辑任一试算输入（开炉分钟 / 电价 / 功率）：立即清除旧试算结果，
-// 此前已发请求的迟到响应（含异常）因代际已新而作废
+// 编辑任一试算输入（开炉分钟 / 电价 / 功率）：立即作废旧试算——清除旧结果
+// 与错误提示、恢复按钮，无需等待此前已发请求结束；其迟到响应（含异常）
+// 因代际已新而作废。
 elecForm.addEventListener("input", () => {
-  trialSeq += 1;
-  clearTrialOutput();
+  invalidateTrial();
 });
 
 function fmtNum(x) {
@@ -1348,11 +1362,15 @@ function renderElectricity(data) {
 
 elecForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  // 只有“当前已归档详情成功加载后”才可提交：加载中 / 读取失败 / 未归档时
+  // elecDraft 均为 null（卡片本身也隐藏）
   if (!elecDraft || elecDraft.status !== "archived") return;
+  // 防止重复提交：当前这一代自身响应未回来前，再次提交一律忽略（按钮也已禁用）
+  if (trialLoading) return;
   clearTrialOutput();
   elecError.hidden = true;
 
-  // 先做客户端校验：此时不占用代际 / 在途计数，旧请求的回包处理不受影响
+  // 先做客户端校验：此时不占用代际 / 在途状态，旧请求的回包处理不受影响
   const startRaw = elecStart.value.trim();
   if (!/^\d+$/.test(startRaw)) {
     elecError.textContent = "开炉分钟必须是 0～1439 之间的整数。";
@@ -1371,9 +1389,11 @@ elecForm.addEventListener("submit", async (ev) => {
   const { values: powers, error: wErr } = readElecPowers(n);
   if (wErr) { elecError.textContent = wErr; elecError.hidden = false; return; }
 
-  // 正式发起请求才登记新一代：旧结果即刻作废，旧回包到达时按代际丢弃
+  // 正式发起请求才登记新一代：旧结果即刻作废，旧回包到达时按代际丢弃；
+  // 按钮只在“这一代自身”的响应回来前禁用。编辑输入 / 切换炉次后，新的提交
+  // 无需等待旧请求结束。
   const seq = ++trialSeq;
-  trialInflight += 1;
+  trialLoading = true;
   elecSubmitBtn.disabled = true;
   elecSubmitBtn.textContent = "试算中…";
   let r;
@@ -1383,25 +1403,24 @@ elecForm.addEventListener("submit", async (ev) => {
       body: JSON.stringify({ startMinute, prices, powers }),
     });
   } catch (e) {
-    trialInflight = Math.max(0, trialInflight - 1);
-    // 网络异常同样只认最新一代：不得回填已被切换 / 编辑作废的试算区
-    if (seq === trialSeq) {
-      elecError.textContent = "试算请求失败（网络异常），未改变任何数据，可重试。";
-      elecError.hidden = false;
-      if (trialInflight === 0) {
-        elecSubmitBtn.disabled = false;
-        elecSubmitBtn.textContent = "试算电费";
-      }
-    }
+    // 网络异常只认当前代际：旧请求（已被编辑 / 切换 / 新提交作废，哪怕切走
+    // 后又回到原炉次）的异常不得回填提示、不得改变当前按钮，也不受它是否
+    // 已经结束影响。
+    if (seq !== trialSeq) return;
+    trialLoading = false;
+    elecError.textContent = "试算请求失败（网络异常），未改变任何数据，可重试。";
+    elecError.hidden = false;
+    resetTrialButton();
     return;
   }
-  trialInflight = Math.max(0, trialInflight - 1);
-  // 迟到响应（切换炉次 / 刷新 / 新试算 / 编辑输入之后到达）一律作废，
-  // 也绝不恢复按钮（按钮只由当前最新一代的在途状态决定）
+  // 迟到响应（切换炉次 / 刷新 / 编辑输入 / 更新的试算之后到达，含切走后又
+  // 回到同一炉次的情形）一律作废：不回填结果或提示，也绝不恢复按钮——
+  // 按钮只由当前最新一代自身的完成来恢复。
   if (seq !== trialSeq) return;
-  elecSubmitBtn.disabled = false;
-  elecSubmitBtn.textContent = "试算电费";
+  trialLoading = false;
+  resetTrialButton();
   if (!r.ok) {
+    // HTTP 错误（404/422/500 等）：展示后端中文原因，可修改后再次试算
     elecError.textContent = detailOf(r.data);
     elecError.hidden = false;
     return;
