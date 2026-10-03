@@ -1190,10 +1190,15 @@ const elecError = document.getElementById("elec-error");
 const elecResult = document.getElementById("elec-result");
 const elecSubmitBtn = document.getElementById("elec-submit-btn");
 
-// trialSeq：试算代际。切换炉次、刷新详情、重建功率表、编辑任一输入都会 +1；
-// 只有最新一代的成功响应 / 失败响应 / 网络异常允许回填，迟到回包一律丢弃。
+// trialSeq：试算代际（当前输入版本）。切换炉次、刷新详情、重建功率表、
+// 编辑任一输入或发起新试算都会 +1；只有最新一代的成功 / HTTP 错误 /
+// 网络异常允许回填结果与提示，迟到回包一律丢弃。
+// trialActiveSeq：当前“占用按钮”的在途请求代际；仅当它 === trialSeq
+// （即最新一代自身仍在等待自身响应）时按钮显示“试算中…”并禁用。
+// 旧代际请求无论在途还是刚刚结束都不触碰按钮——编辑输入 / 切换炉次后
+// 无需等旧请求结束即可再次试算。
 let trialSeq = 0;
-let trialInflight = 0; // 在途试算请求数（用于正确恢复按钮，避免旧回包解锁新请求）
+let trialActiveSeq = 0;
 let elecDraft = null; // 当前试算所绑定的已归档炉次
 
 // 24 小时电价输入（00～23 时）只需建一次；数值作为试算输入保留
@@ -1214,10 +1219,24 @@ function clearTrialOutput() {
 }
 
 function invalidateTrial() {
-  // 旧试算立即作废：代际 +1、清空结果与错误（输入框本身保留供继续编辑）
+  // 旧试算立即作废：代际 +1、清空结果与错误（输入框本身保留供继续编辑），
+  // 并立即释放按钮——编辑输入 / 切换炉次 / 刷新后不必等旧请求结束即可再试算
   trialSeq += 1;
   clearTrialOutput();
   elecError.hidden = true;
+  resetTrialButton(); // trialActiveSeq 归零并恢复按钮，旧在途请求不再占用它
+}
+
+// 按钮只反映“当前这一代是否正在等待自身响应”，不受旧代际在途请求影响
+function syncTrialButton() {
+  const busy = trialActiveSeq !== 0 && trialActiveSeq === trialSeq;
+  elecSubmitBtn.disabled = busy;
+  elecSubmitBtn.textContent = busy ? "试算中…" : "试算电费";
+}
+
+function resetTrialButton() {
+  trialActiveSeq = 0;
+  syncTrialButton();
 }
 
 function rebuildPowerInputs(temperatures) {
@@ -1248,11 +1267,11 @@ function hideTrial() {
   elecCard.hidden = true;
 }
 
-// 编辑任一试算输入（开炉分钟 / 电价 / 功率）：立即清除旧试算结果，
-// 此前已发请求的迟到响应（含异常）因代际已新而作废
+// 编辑任一试算输入（开炉分钟 / 电价 / 功率）：立即清除旧试算结果与提示、
+// 恢复按钮并允许用新输入再次试算；此前已发请求的迟到响应（含异常）因
+// 代际已新而作废，既不回填也不再改动按钮，无需等它结束。
 elecForm.addEventListener("input", () => {
-  trialSeq += 1;
-  clearTrialOutput();
+  invalidateTrial();
 });
 
 function fmtNum(x) {
@@ -1348,11 +1367,16 @@ function renderElectricity(data) {
 
 elecForm.addEventListener("submit", async (ev) => {
   ev.preventDefault();
+  // 只对“已成功读回的已归档详情”开放：加载中（elecDraft 为 null）、
+  // 读取失败（hideTrial 隐藏卡片）、未归档（setupTrial 不会被调用）均不可提交
   if (!elecDraft || elecDraft.status !== "archived") return;
+  // 防止重复提交：当前这一代仍在等待自身响应期间直接忽略后续点击；
+  // 旧代际请求仍在途不会占用按钮，不影响用新输入再次试算
+  if (trialActiveSeq !== 0 && trialActiveSeq === trialSeq) return;
   clearTrialOutput();
   elecError.hidden = true;
 
-  // 先做客户端校验：此时不占用代际 / 在途计数，旧请求的回包处理不受影响
+  // 先做客户端校验：校验失败不登记代际 / 不占用按钮，旧在途请求的回包处理不受影响
   const startRaw = elecStart.value.trim();
   if (!/^\d+$/.test(startRaw)) {
     elecError.textContent = "开炉分钟必须是 0～1439 之间的整数。";
@@ -1371,11 +1395,11 @@ elecForm.addEventListener("submit", async (ev) => {
   const { values: powers, error: wErr } = readElecPowers(n);
   if (wErr) { elecError.textContent = wErr; elecError.hidden = false; return; }
 
-  // 正式发起请求才登记新一代：旧结果即刻作废，旧回包到达时按代际丢弃
+  // 正式发起请求才登记新一代并占用按钮：旧结果即刻作废，按钮在本次响应
+  // （自身响应）返回前禁用；旧代际请求仍在途也不影响本次提交
   const seq = ++trialSeq;
-  trialInflight += 1;
-  elecSubmitBtn.disabled = true;
-  elecSubmitBtn.textContent = "试算中…";
+  trialActiveSeq = seq;
+  syncTrialButton();
   let r;
   try {
     r = await api(`/api/drafts/${elecDraft.id}/electricity`, {
@@ -1383,24 +1407,22 @@ elecForm.addEventListener("submit", async (ev) => {
       body: JSON.stringify({ startMinute, prices, powers }),
     });
   } catch (e) {
-    trialInflight = Math.max(0, trialInflight - 1);
-    // 网络异常同样只认最新一代：不得回填已被切换 / 编辑作废的试算区
-    if (seq === trialSeq) {
+    // 只有“当前这一代自身”的网络异常可以恢复按钮并提示重试；
+    // 旧代际异常（编辑输入 / 切换 / 新试算之后到达）一律静默丢弃，
+    // 不回填提示、不改变当前按钮，哪怕切走后又回到原炉次
+    if (seq === trialSeq && trialActiveSeq === seq) {
+      resetTrialButton();
       elecError.textContent = "试算请求失败（网络异常），未改变任何数据，可重试。";
       elecError.hidden = false;
-      if (trialInflight === 0) {
-        elecSubmitBtn.disabled = false;
-        elecSubmitBtn.textContent = "试算电费";
-      }
     }
     return;
   }
-  trialInflight = Math.max(0, trialInflight - 1);
-  // 迟到响应（切换炉次 / 刷新 / 新试算 / 编辑输入之后到达）一律作废，
-  // 也绝不恢复按钮（按钮只由当前最新一代的在途状态决定）
+  // 迟到响应（切换炉次 / 刷新 / 新试算 / 编辑输入之后到达）一律作废：
+  // 不回填结果与提示，也绝不恢复按钮（按钮只由当前最新一代的在途状态决定，
+  // 旧请求何时结束都不再影响它）
   if (seq !== trialSeq) return;
-  elecSubmitBtn.disabled = false;
-  elecSubmitBtn.textContent = "试算电费";
+  // 本次（当前最新一代）响应已到：恢复操作——成功展示结果，HTTP 错误显示原因
+  resetTrialButton();
   if (!r.ok) {
     elecError.textContent = detailOf(r.data);
     elecError.hidden = false;
